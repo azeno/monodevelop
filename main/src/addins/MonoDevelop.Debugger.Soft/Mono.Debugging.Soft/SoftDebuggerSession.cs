@@ -59,6 +59,7 @@ namespace Mono.Debugging.Soft
 		StepEventRequest currentStepRequest;
 		ExceptionEventRequest unhandledExceptionRequest;
 		string remoteProcessName;
+		Dictionary<long,long> legacyFakeThreadIds;
 		
 		Dictionary<long,ObjectMirror> activeExceptionsByThread = new Dictionary<long, ObjectMirror> ();
 		
@@ -534,8 +535,12 @@ namespace Mono.Debugging.Soft
 		{
 			if (current_threads == null) {
 				List<ThreadInfo> threads = new List<ThreadInfo> ();
-				foreach (ThreadMirror t in vm.GetThreads ())
-					threads.Add (new ThreadInfo (processId, t.Id, t.Name, null));
+				foreach (ThreadMirror t in vm.GetThreads ()) {
+					string name = t.Name;
+					if (string.IsNullOrEmpty (name) && t.IsThreadPoolThread)
+						name = "<Thread Pool>";
+					threads.Add (new ThreadInfo (processId, GetId (t), name, null));
+				}
 				current_threads = threads.ToArray ();
 			}
 			return current_threads;
@@ -544,15 +549,16 @@ namespace Mono.Debugging.Soft
 		ThreadMirror GetThread (long processId, long threadId)
 		{
 			foreach (ThreadMirror t in vm.GetThreads ())
-				if (t.Id == threadId)
+				if (GetId (t) == threadId)
 					return t;
 			return null;
 		}
 		
 		ThreadInfo GetThread (ProcessInfo process, ThreadMirror thread)
 		{
+			long tid = GetId (thread);
 			foreach (var t in OnGetThreads (process.Id))
-				if (t.Id == thread.Id)
+				if (t.Id == tid)
 					return t;
 			return null;
 		}
@@ -640,7 +646,6 @@ namespace Mono.Debugging.Soft
 		{
 			if (!started)
 				return null;
-			string filename = System.IO.Path.GetFileName (file);
 	
 			// Try the current class first
 			Location target_loc = null;// = GetLocFromType (current_thread.GetFrames()[0].Method.DeclaringType, filename, line);
@@ -649,9 +654,9 @@ namespace Mono.Debugging.Soft
 			if (target_loc == null) {
 				List<TypeMirror> types;
 	
-				if (source_to_type.TryGetValue (filename, out types)) {
+				if (source_to_type.TryGetValue (file, out types)) {
 					foreach (TypeMirror t in types) {
-						target_loc = GetLocFromType (t, filename, line);
+						target_loc = GetLocFromType (t, file, line);
 						if (target_loc != null)
 							break;
 					}
@@ -755,7 +760,7 @@ namespace Mono.Debugging.Soft
 				);
 				foreach (KeyValuePair<EventRequest,BreakInfo> breakpoint in affectedBreakpoints) {
 					OnDebuggerOutput (false, string.Format ("Re-pending breakpoint at {0}:{1}\n",
-					                                        Path.GetFileName (breakpoint.Value.Location.SourceFile),
+					                                        breakpoint.Value.Location.SourceFile,
 					                                        breakpoint.Value.Location.LineNumber));
 					breakpoints.Remove (breakpoint.Key);
 					pending_bes.Add (breakpoint.Value.BreakEvent);
@@ -843,7 +848,7 @@ namespace Mono.Debugging.Soft
 				args.Backtrace = GetThreadBacktrace (current_thread);
 				
 				if (exception != null)
-					activeExceptionsByThread [current_thread.Id] = exception;
+					activeExceptionsByThread [current_thread.ThreadId] = exception;
 				
 				OnTargetEvent (args);
 			}
@@ -864,7 +869,7 @@ namespace Mono.Debugging.Soft
 		public ObjectMirror GetExceptionObject (ThreadMirror thread)
 		{
 			ObjectMirror obj;
-			if (activeExceptionsByThread.TryGetValue (thread.Id, out obj))
+			if (activeExceptionsByThread.TryGetValue (thread.ThreadId, out obj))
 				return obj;
 			else
 				return null;
@@ -1040,7 +1045,7 @@ namespace Mono.Debugging.Soft
 			
 			var resolved = new List<BreakEvent> ();
 			
-			foreach (string s in t.GetSourceFiles ()) {
+			foreach (string s in t.GetSourceFiles (true)) {
 				List<TypeMirror> typesList;
 				
 				if (source_to_type.TryGetValue (s, out typesList)) {
@@ -1053,7 +1058,7 @@ namespace Mono.Debugging.Soft
 				
 				
 				foreach (var bp in pending_bes.OfType<Breakpoint> ()) {
-					if (System.IO.Path.GetFileName (bp.FileName) == s) {
+					if (bp.FileName == s) {
 						Location l = GetLocFromType (t, s, bp.Line);
 						if (l != null) {
 							OnDebuggerOutput (false, string.Format ("Resolved pending breakpoint at '{0}:{1}' to {2}:{3}.\n",
@@ -1090,7 +1095,7 @@ namespace Mono.Debugging.Soft
 			Location target_loc = null;
 			foreach (MethodMirror m in type.GetMethods ()) {
 				foreach (Location l in m.Locations) {
-					if (System.IO.Path.GetFileName (l.SourceFile) == file && l.LineNumber == line) {
+					if (l.SourceFile == file && l.LineNumber == line) {
 						target_loc = l;
 						break;
 						}
@@ -1189,17 +1194,39 @@ namespace Mono.Debugging.Soft
 		{
 			var infos = process.GetThreads ();
 			
-			if (ThreadIsAlive (recent_thread) && HasUserFrame (recent_thread.Id, infos))
+			if (ThreadIsAlive (recent_thread) && HasUserFrame (GetId (recent_thread), infos))
 				return;
 
 			var threads = vm.GetThreads ();
 			foreach (var thread in threads) {
-				if (ThreadIsAlive (thread) && HasUserFrame (thread.Id, infos)) {
+				if (ThreadIsAlive (thread) && HasUserFrame (GetId (thread), infos)) {
 					recent_thread = thread;
 					return;
 				}
 			}
 			recent_thread = threads[0];	
+		}
+		
+		long GetId (ThreadMirror thread)
+		{
+			if (legacyFakeThreadIds != null) {
+				// TID is not supported in the debugged app, so we have to create a fake thread id,
+				// since ThreadId is not suitable to be displayed to the user
+				long id;
+				if (!legacyFakeThreadIds.TryGetValue (thread.ThreadId, out id)) {
+					id = legacyFakeThreadIds.Count + 1;
+					legacyFakeThreadIds [thread.ThreadId] = id;
+				}
+				return id;
+			}
+			else {
+				try {
+					return thread.TID;
+				} catch {
+					legacyFakeThreadIds = new Dictionary<long, long> ();
+					return GetId (thread);
+				}
+			}
 		}
 		
 		static bool ThreadIsAlive (ThreadMirror thread)
